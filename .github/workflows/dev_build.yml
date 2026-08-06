@@ -1,5 +1,9 @@
 name: Publish Development Build
-on: push
+on:
+  push:
+    branches: [ '**' ]
+  release:
+    types: [ prereleased, released ]
 
 jobs:
   build:
@@ -23,12 +27,24 @@ jobs:
       - name: Build with Gradle
         run: ./gradlew build
 
-      - name: Release
+      - name: Release Dev Build
+        if: github.event_name != 'release'
         uses: softprops/action-gh-release@v3
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
           tag_name: snapshot
           name: Dev Build
           prerelease: true
+          files: |
+            ./build/libs/*.jar
+
+      - name: Release
+        if: github.event_name == 'release'
+        uses: softprops/action-gh-release@v3
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          tag_name: ${{ github.event.release.tag_name }}
+          name: ${{ github.event.release.name }}
+          prerelease: ${{ github.event.release.prerelease }}
           files: |
             ./build/libs/*.jar
