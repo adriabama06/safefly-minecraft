@@ -63,6 +63,9 @@ public class SafeFly extends Module {
     // "Baritone is done" signal.
     private int settledTicks = 0;
 
+    // Ticks elapsed in the current state (used for the WALKING safety timeout).
+    private int ticksInState = 0;
+
     // For the WALKING state we still need to observe normal ground pathing
     // start, since isPathing() briefly returns false when a new goto is sent
     // while it computes the first path.
@@ -73,6 +76,15 @@ public class SafeFly extends Module {
     // absorb Baritone landing finalization / path recalculations but short
     // enough to feel responsive.
     private static final int SETTLED_TICKS_REQUIRED = 20;
+
+    // How close (in blocks) the player must be to the target to consider
+    // themselves "already there" without needing Baritone to walk.
+    private static final int ALREADY_THERE_RADIUS = 2;
+
+    // Safety timeout for the WALKING state. If Baritone hasn't started walking
+    // within this many ticks (e.g. landed exactly on the target, or path
+    // impossible), give up and build the box where we stand.
+    private static final int WALKING_START_TIMEOUT = 60; // ~3s
 
     public SafeFly(Category category) {
         super(category, "safe-fly", "Flies to a set of coordinates with Baritone and boxes yourself in Netherrack upon arrival or when you run out of fireworks.");
@@ -134,6 +146,7 @@ public class SafeFly extends Module {
     private void transitionTo(State next) {
         currentState = next;
         settledTicks = 0;
+        ticksInState = 0;
         seenGroundPathingInWalkingState = false;
     }
 
@@ -189,13 +202,19 @@ public class SafeFly extends Module {
         info("Landed. Distance to target: %.1f blocks.", dist);
 
         if (dist <= radius) {
-            info("Within walk radius (%d). Walking to exact spot...", radius);
-            // Cancel any leftover state and start a normal on-foot goto.
+            // If we landed basically on the exact target, skip walking entirely.
+            // Otherwise start a normal on-foot goto.
             baritone.getPathingBehavior().cancelEverything();
-            baritone.getCommandManager().execute(
-                String.format("goto %d %d %d", target.getX(), target.getY(), target.getZ())
-            );
-            transitionTo(State.WALKING);
+            if (playerPos.closerThan(target, ALREADY_THERE_RADIUS)) {
+                info("Landed right on target. Building Netherrack box...");
+                transitionTo(State.BOXING);
+            } else {
+                info("Within walk radius (%d). Walking to exact spot...", radius);
+                baritone.getCommandManager().execute(
+                    String.format("goto %d %d %d", target.getX(), target.getY(), target.getZ())
+                );
+                transitionTo(State.WALKING);
+            }
         } else {
             // Too far — out of rockets or unreachable by flight.
             // Per user request, do NOT attempt to walk all the way there.
@@ -212,15 +231,50 @@ public class SafeFly extends Module {
     /**
      * WALKING: Baritone is walking us to the exact block on foot.
      * We don't interfere — just wait for ground pathing to finish.
-     * Because {@code isPathing()} returns false briefly right after sending a
-     * new {@code goto} (while it computes the first path), we require that
-     * we've seen isPathing()==true at least once in this state before we
-     * trust the "not pathing" signal as "actually done".
+     * Edge cases handled:
+     *   - If we entered WALKING already within a block or two of the target
+     *     (Baritone didn't start pathing because there's nowhere to go),
+     *     finish immediately.
+     *   - If Baritone never starts pathing within a few seconds (target
+     *     unreachable / same spot), time out and box where we stand.
+     *   - Because {@code isPathing()} returns false briefly right after
+     *     sending a new {@code goto} (while it computes the first path), we
+     *     require that we've seen isPathing()==true at least once before we
+     *     trust the "not pathing" signal as "actually done walking".
      */
     private void handleWalkingState() {
+        ticksInState++;
+
+        BlockPos target = targetPos.get();
+        BlockPos playerPos = mc.player.blockPosition();
+
+        // Fast path: already on (or right on top of) the target → we're done,
+        // no need to wait for Baritone to ever start pathing.
+        if (isPlayerSettled() && playerPos.closerThan(target, ALREADY_THERE_RADIUS)) {
+            settledTicks++;
+            if (settledTicks >= SETTLED_TICKS_REQUIRED) {
+                info("Reached exact target. Building Netherrack box...");
+                transitionTo(State.BOXING);
+            }
+            return;
+        }
+
         boolean pathing = baritone.getPathingBehavior().isPathing();
         if (pathing) {
             seenGroundPathingInWalkingState = true;
+        }
+
+        // Safety timeout: if we've been waiting a few seconds and Baritone
+        // never started walking, bail out (probably same-spot or unreachable).
+        if (!seenGroundPathingInWalkingState && ticksInState > WALKING_START_TIMEOUT) {
+            if (playerPos.closerThan(target, 3)) {
+                info("Baritone didn't need to walk (already at target). Building Netherrack box...");
+            } else {
+                warning("Baritone failed to start walking. Building box at current location.");
+            }
+            baritone.getPathingBehavior().cancelEverything();
+            transitionTo(State.BOXING);
+            return;
         }
 
         boolean doneWalking =
@@ -236,14 +290,12 @@ public class SafeFly extends Module {
         settledTicks++;
         if (settledTicks < SETTLED_TICKS_REQUIRED) return;
 
-        BlockPos target = targetPos.get();
-        BlockPos playerPos = mc.player.blockPosition();
-
         if (playerPos.closerThan(target, 3)) {
             info("Reached exact target. Building Netherrack box...");
         } else {
             warning("Could not reach the exact spot, building box where I stand.");
         }
+        baritone.getPathingBehavior().cancelEverything();
         transitionTo(State.BOXING);
     }
 
