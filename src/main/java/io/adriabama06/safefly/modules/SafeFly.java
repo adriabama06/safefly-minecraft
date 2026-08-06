@@ -2,6 +2,7 @@ package io.adriabama06.safefly.modules;
 
 import baritone.api.BaritoneAPI;
 import baritone.api.IBaritone;
+import baritone.api.process.IElytraProcess;
 import meteordevelopment.meteorclient.events.world.TickEvent;
 import meteordevelopment.meteorclient.settings.BlockPosSetting;
 import meteordevelopment.meteorclient.settings.IntSetting;
@@ -57,26 +58,21 @@ public class SafeFly extends Module {
     // Counters / guards ----------------------------------------------------
     private int noFireworkWarnCooldown = 0;
 
-    // Per-state tracking used to robustly detect when Baritone is *actually*
-    // done with the current job, rather than just briefly between path segments
-    // or computing the initial route.
-    private int ticksInState = 0;
-    private int ticksSinceLastSeenPathing = 0;
-    private boolean seenBaritoneActiveInThisState = false;
+    // Consecutive ticks the player has been "settled" (on ground, not flying)
+    // while the current Baritone process is not active. Used to debounce the
+    // "Baritone is done" signal.
+    private int settledTicks = 0;
 
-    // How many ticks to wait after Baritone stops reporting isPathing() before
-    // we consider the current phase (flying / walking) truly finished. This
-    // absorbs:
-    //   - The initial gap between sending a `goto`/`elytra` command and the
-    //     first path actually being computed (isPathing() is false during it).
-    //   - Brief re-calculation pauses mid-flight/mid-walk.
-    // 40 ticks ≈ 2 seconds.
-    private static final int DONE_TICKS_THRESHOLD = 40;
+    // For the WALKING state we still need to observe normal ground pathing
+    // start, since isPathing() briefly returns false when a new goto is sent
+    // while it computes the first path.
+    private boolean seenGroundPathingInWalkingState = false;
 
-    // Safety timeout per state. If Baritone has failed to make progress for
-    // this many ticks in a given state, force a transition rather than hang
-    // forever (e.g. unreachable target, path compute failure).
-    private static final int STATE_TIMEOUT_TICKS = 20 * 60; // 60 seconds
+    // Ticks needed settled on the ground + baritone process inactive before
+    // we consider the phase truly finished. 20 ticks = ~1 second, enough to
+    // absorb Baritone landing finalization / path recalculations but short
+    // enough to feel responsive.
+    private static final int SETTLED_TICKS_REQUIRED = 20;
 
     public SafeFly(Category category) {
         super(category, "safe-fly", "Flies to a set of coordinates with Baritone and boxes yourself in Netherrack upon arrival or when you run out of fireworks.");
@@ -91,15 +87,24 @@ public class SafeFly extends Module {
 
         transitionTo(State.FLYING);
 
-        // Set the goal first, then start Baritone's elytra process.
-        // Using Baritone commands (same as typing #goto / #elytra in chat)
-        // ensures we don't depend on internal setting names that vary by version.
-        // CRITICAL: we do NOT cancel Baritone afterwards — Baritone must handle
-        // the entire flight + landing by itself.
-        baritone.getCommandManager().execute(
-            String.format("goto %d %d %d", target.getX(), target.getY(), target.getZ())
-        );
-        baritone.getCommandManager().execute("elytra");
+        // Use Baritone's dedicated Elytra process via the public API.
+        // This is exactly what the #elytra chat command does internally, and
+        // it lets us reliably check isActive() / currentDestination() to know
+        // when the flight (including landing) is really over.
+        //
+        // CRITICAL: we do NOT cancel Baritone afterwards. Baritone must handle
+        // the entire flight + landing by itself, choosing its own safe landing
+        // spot near the destination.
+        IElytraProcess elytra = baritone.getElytraProcess();
+        if (!elytra.isLoaded()) {
+            warning("Baritone elytra native library not loaded — is the elytra mode available? Trying command fallback...");
+            baritone.getCommandManager().execute(
+                String.format("goto %d %d %d", target.getX(), target.getY(), target.getZ())
+            );
+            baritone.getCommandManager().execute("elytra");
+        } else {
+            elytra.pathTo(target);
+        }
     }
 
     @Override
@@ -126,75 +131,34 @@ public class SafeFly extends Module {
     // Helpers
     // ------------------------------------------------------------------
 
-    /**
-     * Call when switching states. Resets all per-state bookkeeping.
-     */
     private void transitionTo(State next) {
         currentState = next;
-        ticksInState = 0;
-        ticksSinceLastSeenPathing = 0;
-        seenBaritoneActiveInThisState = false;
+        settledTicks = 0;
+        seenGroundPathingInWalkingState = false;
     }
 
     /**
-     * Update per-state bookkeeping each tick. Returns {@code true} once
-     * Baritone appears to be done with the current phase (landed / arrived).
-     *
-     * We do NOT trust "not pathing" on its own: Baritone returns false from
-     * isPathing() both when calculating the very first path (right after a
-     * command is sent) and during short re-calculations mid-route.
-     *
-     * To avoid declaring "done" while Baritone is still about to walk/fly:
-     *   1. We must have observed isPathing() == true at least once in this
-     *      state (so we know Baritone actually started working).
-     *   2. isPathing() must have been false for DONE_TICKS_THRESHOLD ticks
-     *      straight (absorbs computation gaps).
-     *   3. The player must be on the ground and NOT fall-flying (so we don't
-     *      trigger this while still mid-air).
+     * @return {@code true} if the player is on the ground and not gliding.
      */
-    private boolean tickAndCheckBaritoneDone(boolean requireOnGround) {
-        ticksInState++;
-
-        boolean baritonePathing = baritone.getPathingBehavior().isPathing();
-
-        if (baritonePathing) {
-            seenBaritoneActiveInThisState = true;
-            ticksSinceLastSeenPathing = 0;
-        } else {
-            ticksSinceLastSeenPathing++;
-        }
-
-        // Safety timeout: if we've waited too long without seeing Baritone
-        // actively pathing, treat it as done so we don't hang forever on
-        // unreachable targets.
-        if (ticksInState > STATE_TIMEOUT_TICKS) {
-            warning("Baritone seems stuck (state timed out after %d s). Moving on.", STATE_TIMEOUT_TICKS / 20);
-            return true;
-        }
-
-        // Must have seen Baritone actually start working first.
-        if (!seenBaritoneActiveInThisState) return false;
-
-        // Must have been idle (not pathing) for long enough.
-        if (ticksSinceLastSeenPathing < DONE_TICKS_THRESHOLD) return false;
-
-        // Ground check (most phases require being on ground to be "done").
-        if (requireOnGround && (!mc.player.onGround() || mc.player.isFallFlying())) {
-            return false;
-        }
-
-        return true;
+    private boolean isPlayerSettled() {
+        return mc.player.onGround() && !mc.player.isFallFlying();
     }
 
+    // ------------------------------------------------------------------
+    // FLYING
+    // ------------------------------------------------------------------
+
     /**
-     * FLYING: we let Baritone do its thing (elytra flight + landing).
-     * We do NOT cancel Baritone here. We only observe:
-     *   - Warn once if out of fireworks (Baritone will still land safely).
-     *   - When Baritone is fully done and the player is on the ground, decide
-     *     whether to walk the rest of the way or go straight to boxing.
+     * FLYING: let Baritone's ElytraProcess fly to the destination and land
+     * completely on its own. We do NOT cancel it. We observe the elytra
+     * process directly: when {@code isActive()} returns {@code false} (no
+     * destination, flight done / landed) AND the player has been settled on
+     * the ground for a short debounce period, we decide whether to walk the
+     * last few blocks or build the box directly.
      */
     private void handleFlyingState() {
-        // Low-fireworks warning (non-intrusive, just a reminder).
+        // Low-fireworks warning (non-intrusive). Baritone handles landing
+        // automatically when it can't boost anymore.
         FindItemResult fireworks = InvUtils.find(Items.FIREWORK_ROCKET);
         boolean hasEnoughFireworks = fireworks.found() && fireworks.count() >= minFireworks.get();
         if (!hasEnoughFireworks && minFireworks.get() > 0 && noFireworkWarnCooldown <= 0) {
@@ -203,8 +167,20 @@ public class SafeFly extends Module {
         }
         if (noFireworkWarnCooldown > 0) noFireworkWarnCooldown--;
 
-        if (!tickAndCheckBaritoneDone(true)) return;
+        IElytraProcess elytra = baritone.getElytraProcess();
+        boolean elytraActive = elytra.isActive() || elytra.currentDestination() != null;
 
+        if (elytraActive || !isPlayerSettled()) {
+            // Still flying, or still landing/settling. Reset debounce.
+            settledTicks = 0;
+            return;
+        }
+
+        settledTicks++;
+        if (settledTicks < SETTLED_TICKS_REQUIRED) return;
+
+        // Elytra process is inactive AND the player has been on the ground
+        // (not fall-flying) for ~1 second → Baritone has finished landing.
         BlockPos target = targetPos.get();
         BlockPos playerPos = mc.player.blockPosition();
         double dist = Math.sqrt(playerPos.distSqr(target));
@@ -214,28 +190,51 @@ public class SafeFly extends Module {
 
         if (dist <= radius) {
             info("Within walk radius (%d). Walking to exact spot...", radius);
-            // Cancel the elytra process and start a fresh on-foot goto to the
-            // exact coordinates.
+            // Cancel any leftover state and start a normal on-foot goto.
             baritone.getPathingBehavior().cancelEverything();
             baritone.getCommandManager().execute(
                 String.format("goto %d %d %d", target.getX(), target.getY(), target.getZ())
             );
             transitionTo(State.WALKING);
         } else {
-            // Too far — almost certainly out of fireworks or couldn't reach the
-            // target. Per user request, do NOT attempt to walk all the way.
+            // Too far — out of rockets or unreachable by flight.
+            // Per user request, do NOT attempt to walk all the way there.
             warning("Landed too far from target (%.1f blocks > %d). Skipping walk, building box at current location.", dist, radius);
             baritone.getPathingBehavior().cancelEverything();
             transitionTo(State.BOXING);
         }
     }
 
+    // ------------------------------------------------------------------
+    // WALKING
+    // ------------------------------------------------------------------
+
     /**
      * WALKING: Baritone is walking us to the exact block on foot.
-     * Again, we just wait for Baritone to finish and don't interfere.
+     * We don't interfere — just wait for ground pathing to finish.
+     * Because {@code isPathing()} returns false briefly right after sending a
+     * new {@code goto} (while it computes the first path), we require that
+     * we've seen isPathing()==true at least once in this state before we
+     * trust the "not pathing" signal as "actually done".
      */
     private void handleWalkingState() {
-        if (!tickAndCheckBaritoneDone(true)) return;
+        boolean pathing = baritone.getPathingBehavior().isPathing();
+        if (pathing) {
+            seenGroundPathingInWalkingState = true;
+        }
+
+        boolean doneWalking =
+               seenGroundPathingInWalkingState
+            && !pathing
+            && isPlayerSettled();
+
+        if (!doneWalking) {
+            settledTicks = 0;
+            return;
+        }
+
+        settledTicks++;
+        if (settledTicks < SETTLED_TICKS_REQUIRED) return;
 
         BlockPos target = targetPos.get();
         BlockPos playerPos = mc.player.blockPosition();
