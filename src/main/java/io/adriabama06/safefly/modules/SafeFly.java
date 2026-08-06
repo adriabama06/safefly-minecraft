@@ -11,8 +11,6 @@ import meteordevelopment.meteorclient.settings.EnumSetting;
 import meteordevelopment.meteorclient.settings.IntSetting;
 import meteordevelopment.meteorclient.settings.Setting;
 import meteordevelopment.meteorclient.settings.SettingGroup;
-import baritone.api.pathing.goals.GoalBlock;
-import baritone.api.pathing.goals.GoalXZ;
 import meteordevelopment.meteorclient.systems.modules.Category;
 import meteordevelopment.meteorclient.systems.modules.Module;
 import meteordevelopment.meteorclient.utils.player.FindItemResult;
@@ -579,7 +577,7 @@ public class SafeFly extends Module {
         BlockPos pPos = mc.player.blockPosition();
 
         BlockPos[] boxPositions = new BlockPos[] {
-            pPos.below(),
+            pPos.below(), pPos.below().north(),
             pPos.north(), pPos.south(), pPos.east(), pPos.west(),
             pPos.above().north(), pPos.above().south(), pPos.above().east(), pPos.above().west(),
             pPos.above(2).north(), pPos.above(2)
