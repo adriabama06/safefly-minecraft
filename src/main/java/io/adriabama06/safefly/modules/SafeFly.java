@@ -3,12 +3,16 @@ package io.adriabama06.safefly.modules;
 import baritone.api.BaritoneAPI;
 import baritone.api.IBaritone;
 import baritone.api.process.IElytraProcess;
+import baritone.api.pathing.goals.GoalBlock;
+import baritone.api.pathing.goals.GoalXZ;
 import meteordevelopment.meteorclient.events.world.TickEvent;
 import meteordevelopment.meteorclient.settings.BlockPosSetting;
 import meteordevelopment.meteorclient.settings.EnumSetting;
 import meteordevelopment.meteorclient.settings.IntSetting;
 import meteordevelopment.meteorclient.settings.Setting;
 import meteordevelopment.meteorclient.settings.SettingGroup;
+import baritone.api.pathing.goals.GoalBlock;
+import baritone.api.pathing.goals.GoalXZ;
 import meteordevelopment.meteorclient.systems.modules.Category;
 import meteordevelopment.meteorclient.systems.modules.Module;
 import meteordevelopment.meteorclient.utils.player.FindItemResult;
@@ -145,9 +149,15 @@ public class SafeFly extends Module {
         IElytraProcess elytra = baritone.getElytraProcess();
         if (!elytra.isLoaded()) {
             warning("Baritone elytra native library not loaded — is the elytra mode available? Trying command fallback...");
-            baritone.getCommandManager().execute(
-                String.format("goto %d %d %d", baritoneTarget.getX(), baritoneTarget.getY(), baritoneTarget.getZ())
-            );
+            if (isXZ()) {
+                baritone.getCommandManager().execute(
+                    String.format("goto %d %d", baritoneTarget.getX(), baritoneTarget.getZ())
+                );
+            } else {
+                baritone.getCommandManager().execute(
+                    String.format("goto %d %d %d", baritoneTarget.getX(), baritoneTarget.getY(), baritoneTarget.getZ())
+                );
+            }
             baritone.getCommandManager().execute("elytra");
         } else {
             elytra.pathTo(baritoneTarget);
@@ -238,6 +248,18 @@ public class SafeFly extends Module {
         }
     }
 
+    /**
+     * Set Baritone walking goal correctly for the current coordinate mode.
+     * In XYZ uses GoalBlock (exact X Y Z), in XZ uses GoalXZ (only X Z, Y ignored).
+     */
+    private void setWalkingGoal(BlockPos pos) {
+        if (isXZ()) {
+            baritone.getCustomGoalProcess().setGoalAndPath(new GoalXZ(pos.getX(), pos.getZ()));
+        } else {
+            baritone.getCustomGoalProcess().setGoalAndPath(new GoalBlock(pos));
+        }
+    }
+
     // ------------------------------------------------------------------
     // FLYING
     // ------------------------------------------------------------------
@@ -300,10 +322,7 @@ public class SafeFly extends Module {
                 } else {
                     info("Within walk radius (%d). Walking to exact spot...", radius);
                 }
-                BlockPos walkTarget = getBaritoneTarget(target);
-                baritone.getCommandManager().execute(
-                    String.format("goto %d %d %d", walkTarget.getX(), walkTarget.getY(), walkTarget.getZ())
-                );
+                setWalkingGoal(target);
                 transitionTo(State.WALKING);
             }
         } else {
@@ -415,13 +434,8 @@ public class SafeFly extends Module {
         // end up on top of blockToCenterOn (i.e. feet Y = blockToCenterOn.y + 1
         // when standing on a solid block). Baritone's goto to the solid block
         // itself will place us standing on top of it.
-        // In XZ mode we keep X/Z from the requested block but use the player's
-        // current Y so Baritone only pathfinds horizontally.
-        BlockPos gotoPos = getBaritoneTarget(blockToCenterOn);
         baritone.getPathingBehavior().cancelEverything();
-        baritone.getCommandManager().execute(
-            String.format("goto %d %d %d", gotoPos.getX(), gotoPos.getY(), gotoPos.getZ())
-        );
+        setWalkingGoal(blockToCenterOn);
         transitionTo(State.CENTERING);
     }
 
