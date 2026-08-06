@@ -489,7 +489,7 @@ public class SafeFly extends Module {
             pPos.below(),
             pPos.north(), pPos.south(), pPos.east(), pPos.west(),
             pPos.above().north(), pPos.above().south(), pPos.above().east(), pPos.above().west(),
-            pPos.above(2)
+            pPos.above(2).north(), pPos.above(2)
         };
 
         boolean finishedBuilding = true;
