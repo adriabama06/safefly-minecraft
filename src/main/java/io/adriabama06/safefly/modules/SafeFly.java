@@ -17,6 +17,9 @@ import meteordevelopment.orbit.EventHandler;
 import net.minecraft.core.BlockPos;
 import net.minecraft.world.item.Items;
 
+// Baritone movement-input enum (used to tap forward/back/left/right).
+import baritone.api.utils.input.Input;
+
 public class SafeFly extends Module {
     private final SettingGroup sgGeneral = settings.getDefaultGroup();
 
@@ -48,6 +51,7 @@ public class SafeFly extends Module {
     private enum State {
         FLYING,    // Baritone elytra-flying + landing completely on its own
         WALKING,   // Landed within radius, Baritone walking to exact spot
+        CENTERING, // Snap to center of the target block so the cube builds cleanly
         BOXING,    // Building the Netherrack box (UNTOUCHED)
         IDLE
     }
@@ -63,13 +67,17 @@ public class SafeFly extends Module {
     // "Baritone is done" signal.
     private int settledTicks = 0;
 
-    // Ticks elapsed in the current state (used for the WALKING safety timeout).
+    // Ticks elapsed in the current state (used for the WALKING/CENTERING safety timeouts).
     private int ticksInState = 0;
 
     // For the WALKING state we still need to observe normal ground pathing
     // start, since isPathing() briefly returns false when a new goto is sent
     // while it computes the first path.
     private boolean seenGroundPathingInWalkingState = false;
+
+    // For CENTERING: once Baritone has landed us on the right block column,
+    // we take over for the final sub-block snap to the center.
+    private boolean baritoneCenteringFinished = false;
 
     // Ticks needed settled on the ground + baritone process inactive before
     // we consider the phase truly finished. 20 ticks = ~1 second, enough to
@@ -85,6 +93,14 @@ public class SafeFly extends Module {
     // within this many ticks (e.g. landed exactly on the target, or path
     // impossible), give up and build the box where we stand.
     private static final int WALKING_START_TIMEOUT = 60; // ~3s
+
+    // Max time to spend trying to center. If we can't get the player onto
+    // the center (e.g. stuck, blocked), just box them where they are.
+    private static final int CENTERING_TIMEOUT = 200; // ~10s
+
+    // How close to the exact center (in blocks) we need to be before starting
+    // to build the cube. Block-center is at x+0.5, z+0.5.
+    private static final double CENTER_TOLERANCE = 0.1;
 
     public SafeFly(Category category) {
         super(category, "safe-fly", "Flies to a set of coordinates with Baritone and boxes yourself in Netherrack upon arrival or when you run out of fireworks.");
@@ -134,6 +150,7 @@ public class SafeFly extends Module {
         switch (currentState) {
             case FLYING -> handleFlyingState();
             case WALKING -> handleWalkingState();
+            case CENTERING -> handleCenteringState();
             case BOXING -> handleBoxingState();
             case IDLE -> {}
         }
@@ -148,6 +165,7 @@ public class SafeFly extends Module {
         settledTicks = 0;
         ticksInState = 0;
         seenGroundPathingInWalkingState = false;
+        baritoneCenteringFinished = false;
     }
 
     /**
@@ -202,12 +220,13 @@ public class SafeFly extends Module {
         info("Landed. Distance to target: %.1f blocks.", dist);
 
         if (dist <= radius) {
-            // If we landed basically on the exact target, skip walking entirely.
-            // Otherwise start a normal on-foot goto.
+            // If we landed basically on the exact target block, skip walking
+            // and go straight to centering on that block's center. Otherwise
+            // start a normal on-foot goto first.
             baritone.getPathingBehavior().cancelEverything();
             if (playerPos.closerThan(target, ALREADY_THERE_RADIUS)) {
-                info("Landed right on target. Building Netherrack box...");
-                transitionTo(State.BOXING);
+                info("Landed right on target. Centering on block...");
+                beginCentering(playerPos);
             } else {
                 info("Within walk radius (%d). Walking to exact spot...", radius);
                 baritone.getCommandManager().execute(
@@ -218,9 +237,10 @@ public class SafeFly extends Module {
         } else {
             // Too far — out of rockets or unreachable by flight.
             // Per user request, do NOT attempt to walk all the way there.
+            // Still center on the current block so the cube builds cleanly.
             warning("Landed too far from target (%.1f blocks > %d). Skipping walk, building box at current location.", dist, radius);
             baritone.getPathingBehavior().cancelEverything();
-            transitionTo(State.BOXING);
+            beginCentering(playerPos);
         }
     }
 
@@ -236,11 +256,14 @@ public class SafeFly extends Module {
      *     (Baritone didn't start pathing because there's nowhere to go),
      *     finish immediately.
      *   - If Baritone never starts pathing within a few seconds (target
-     *     unreachable / same spot), time out and box where we stand.
+     *     unreachable / same spot), time out and center/box where we stand.
      *   - Because {@code isPathing()} returns false briefly right after
      *     sending a new {@code goto} (while it computes the first path), we
      *     require that we've seen isPathing()==true at least once before we
      *     trust the "not pathing" signal as "actually done walking".
+     * When we reach the destination block, we transition to CENTERING (not
+     * BOXING) so the final sub-block snap to the center happens before the
+     * cube is placed.
      */
     private void handleWalkingState() {
         ticksInState++;
@@ -248,13 +271,14 @@ public class SafeFly extends Module {
         BlockPos target = targetPos.get();
         BlockPos playerPos = mc.player.blockPosition();
 
-        // Fast path: already on (or right on top of) the target → we're done,
-        // no need to wait for Baritone to ever start pathing.
+        // Fast path: already on (or right on top of) the target → skip to
+        // centering, no need to wait for Baritone to ever start pathing.
         if (isPlayerSettled() && playerPos.closerThan(target, ALREADY_THERE_RADIUS)) {
             settledTicks++;
             if (settledTicks >= SETTLED_TICKS_REQUIRED) {
-                info("Reached exact target. Building Netherrack box...");
-                transitionTo(State.BOXING);
+                info("Reached target block. Centering...");
+                baritone.getPathingBehavior().cancelEverything();
+                beginCentering(target);
             }
             return;
         }
@@ -265,15 +289,17 @@ public class SafeFly extends Module {
         }
 
         // Safety timeout: if we've been waiting a few seconds and Baritone
-        // never started walking, bail out (probably same-spot or unreachable).
+        // never started walking, bail out (probably same-spot or unreachable)
+        // and center/box where we stand.
         if (!seenGroundPathingInWalkingState && ticksInState > WALKING_START_TIMEOUT) {
             if (playerPos.closerThan(target, 3)) {
-                info("Baritone didn't need to walk (already at target). Building Netherrack box...");
+                info("Baritone didn't need to walk (already at target). Centering...");
             } else {
-                warning("Baritone failed to start walking. Building box at current location.");
+                warning("Baritone failed to start walking. Centering/boxing at current location.");
+                target = playerPos;
             }
             baritone.getPathingBehavior().cancelEverything();
-            transitionTo(State.BOXING);
+            beginCentering(target);
             return;
         }
 
@@ -290,13 +316,161 @@ public class SafeFly extends Module {
         settledTicks++;
         if (settledTicks < SETTLED_TICKS_REQUIRED) return;
 
-        if (playerPos.closerThan(target, 3)) {
-            info("Reached exact target. Building Netherrack box...");
+        // Determine the block we actually ended up on. If Baritone got us
+        // close to the target, use the target; otherwise use where we stand.
+        BlockPos centerOn = playerPos.closerThan(target, 3) ? target : playerPos;
+        if (centerOn == target) {
+            info("Reached target block. Centering...");
         } else {
-            warning("Could not reach the exact spot, building box where I stand.");
+            warning("Could not reach the exact spot, centering/boxing where I stand.");
         }
         baritone.getPathingBehavior().cancelEverything();
-        transitionTo(State.BOXING);
+        beginCentering(centerOn);
+    }
+
+    /**
+     * Kick off the CENTERING state for the given block position. We first
+     * ask Baritone for one last fine-grained goto to that block (so it can
+     * climb/step if needed), then once Baritone has us there we manually
+     * walk the sub-block distance to the exact (x+0.5, z+0.5) center.
+     */
+    private void beginCentering(BlockPos blockToCenterOn) {
+        // The cube is built around the player's feet position, so we want to
+        // end up on top of blockToCenterOn (i.e. feet Y = blockToCenterOn.y + 1
+        // when standing on a solid block). Baritone's goto to the solid block
+        // itself will place us standing on top of it.
+        baritone.getPathingBehavior().cancelEverything();
+        baritone.getCommandManager().execute(
+            String.format("goto %d %d %d", blockToCenterOn.getX(), blockToCenterOn.getY(), blockToCenterOn.getZ())
+        );
+        transitionTo(State.CENTERING);
+    }
+
+    /**
+     * CENTERING: snap the player to the exact center (x+0.5, z+0.5) of the
+     * block we've landed on, so the Netherrack cube builds symmetrically
+     * (otherwise if the player is near a block edge, some cube positions
+     * can't be placed because the player's hitbox is in the way).
+     *
+     * Phase 1: let Baritone finish walking us onto the correct block (it
+     * may need to step up a half-block, etc.). If we're already on the
+     * right block, this phase is skipped.
+     *
+     * Phase 2: manually rotate the player to face the block center and
+     * hold MOVE_FORWARD via Baritone's InputOverrideHandler until we're
+     * within CENTER_TOLERANCE of the center. On ground, Minecraft's walk
+     * speed is ~0.1 b/t and friction will stop us quickly once we release,
+     * so overshoot is minimal over the <0.5 blocks of travel involved.
+     */
+    private void handleCenteringState() {
+        ticksInState++;
+
+        // Safety timeout — don't spend forever trying to center.
+        if (ticksInState > CENTERING_TIMEOUT) {
+            warning("Centering timed out, building box where I stand.");
+            baritone.getInputOverrideHandler().clearAllKeys();
+            baritone.getPathingBehavior().cancelEverything();
+            transitionTo(State.BOXING);
+            return;
+        }
+
+        var input = baritone.getInputOverrideHandler();
+
+        // Phase 1: let Baritone get us onto the destination block.
+        boolean pathing = baritone.getPathingBehavior().isPathing();
+        if (pathing) {
+            baritoneCenteringFinished = true;
+        }
+
+        // If we're already settled (on ground, same block we started from)
+        // and Baritone isn't moving us, skip Baritone's phase.
+        if (!baritoneCenteringFinished && !pathing && isPlayerSettled()) {
+            baritoneCenteringFinished = true;
+            settledTicks = 0;
+        }
+        if (baritoneCenteringFinished && pathing) {
+            settledTicks = 0;
+        }
+
+        boolean stillWaitingForBaritone =
+            !baritoneCenteringFinished && ticksInState < WALKING_START_TIMEOUT && pathing;
+        if (stillWaitingForBaritone) {
+            settledTicks = 0;
+            return;
+        }
+
+        // Wait for Baritone to fully settle (not pathing, on ground) for a
+        // few ticks before we take over.
+        if (baritoneCenteringFinished && (pathing || !isPlayerSettled())) {
+            settledTicks = 0;
+            return;
+        }
+        if (baritoneCenteringFinished) {
+            settledTicks++;
+            if (settledTicks < 5) return;
+        }
+
+        // Cancel any remaining Baritone movement so we have full control.
+        if (pathing) {
+            baritone.getPathingBehavior().cancelEverything();
+        }
+
+        // Phase 2: manual nudge to the block center.
+        BlockPos playerBlock = mc.player.blockPosition();
+        double targetX = playerBlock.getX() + 0.5;
+        double targetZ = playerBlock.getZ() + 0.5;
+        double px = mc.player.getX();
+        double pz = mc.player.getZ();
+        double dx = targetX - px;
+        double dz = targetZ - pz;
+        double distH = Math.sqrt(dx * dx + dz * dz);
+
+        if (distH <= CENTER_TOLERANCE || !isPlayerSettled()) {
+            // Done (or got knocked off the ground). Release keys and box.
+            input.clearAllKeys();
+            // Kill any remaining horizontal velocity so we don't drift.
+            var vel = mc.player.getDeltaMovement();
+            mc.player.setDeltaMovement(0, vel.y, 0);
+            info("Centered on block. Building Netherrack box...");
+            transitionTo(State.BOXING);
+            return;
+        }
+
+        // Rotate the player to face the center of the block. Then holding
+        // MOVE_FORWARD will walk exactly toward it.
+        float targetYaw = (float) Math.toDegrees(Math.atan2(-dx, dz));
+        // Minecraft yaw is in [-180, 180], wrap to that range.
+        float currentYaw = mc.player.getYRot();
+        float wrappedTarget = wrapYaw(targetYaw);
+        float yawDiff = wrapYaw(wrappedTarget - currentYaw);
+
+        // Interpolate yaw toward the target so the rotation happens over a
+        // couple of ticks rather than snapping (smoother).
+        float newYaw = currentYaw + yawDiff * 0.5f;
+        mc.player.setYRot(newYaw);
+        mc.player.setXRot(0); // look straight ahead, don't look down/up
+
+        // Stop forward input early enough to let friction halt us on target
+        // (avoids overshoot). Minecraft ground friction is ~0.6 per tick,
+        // so releasing at ~0.05 from target leaves ~1 tick of slide.
+        boolean holdForward = distH > Math.max(CENTER_TOLERANCE + 0.03, 0.05);
+        input.setInputForceState(Input.MOVE_FORWARD, holdForward);
+        input.setInputForceState(Input.MOVE_BACK,    false);
+        input.setInputForceState(Input.MOVE_LEFT,    false);
+        input.setInputForceState(Input.MOVE_RIGHT,   false);
+        input.setInputForceState(Input.JUMP,         false);
+        input.setInputForceState(Input.SNEAK,        false);
+        input.setInputForceState(Input.SPRINT,       false);
+    }
+
+    /**
+     * Wrap a yaw angle (degrees) into [-180, 180].
+     */
+    private static float wrapYaw(float yaw) {
+        yaw = yaw % 360;
+        if (yaw > 180) yaw -= 360;
+        if (yaw < -180) yaw += 360;
+        return yaw;
     }
 
     // ==================== CUBE BUILDING — DO NOT TOUCH ====================
