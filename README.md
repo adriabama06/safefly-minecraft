@@ -1,6 +1,6 @@
-# Meteor Addon Template
+# SafeFly
 
-A template to allow easy usage of the Meteor Addon API.
+A Meteor Client addon that flies to a destination using the Elytra and Baritone, then boxes you in Netherrack for safety upon arrival or when you run out of fireworks.
 
 ### How to use
 
@@ -76,21 +76,22 @@ To update this template to a newer Minecraft version, follow these steps:
 │── src
 │   ╰── main
 │       │── java
-│       │   ╰── com
-│       │       ╰── example
-│       │           ╰── addon
+│       │   ╰── io
+│       │       ╰── adriabama06
+│       │           ╰── safefly
 │       │               │── commands
 │       │               │   ╰── CommandExample
 │       │               │── hud
 │       │               │   ╰── HudExample
 │       │               │── modules
 │       │               │   ╰── ModuleExample
-│       │               ╰── AddonTemplate
+│       │               │   ╰── SafeFly
+│       │               ╰── SafeFlyAddon
 │       ╰── resources
 │           │── assets
-│           │   ╰── template
+│           │   ╰── safefly
 │           │       ╰── icon.png
-│           │── addon-template.mixins.json
+│           │── safefly.mixins.json
 │           ╰── fabric.mod.json
 │── .editorconfig
 │── .gitignore
@@ -111,16 +112,16 @@ Here is a brief explanation of the ones you might need to modify:
   - `libs.versions.toml`: Defines version numbers for Minecraft, Loom, Meteor, and other dependencies.
   - `wrapper`: Contains the Gradle wrapper executable files.  
     To update the Gradle wrapper executable itself, run the wrapper update command (examples are shown above).
-- `src/main/java/com/example/addon`: Contains the main class of the addon.  
+- `src/main/java/io/adriabama06/safefly`: Contains the main class of the addon.  
   Here you can register your custom commands, modules, and HUDs.  
   Edit the `getPackage` method to reflect the package of your addon.
 - `src/main/resources`: Contains the resources of the addon.
     - `assets`: Contains the assets of the addon.  
       You can add your own assets here, separated in subfolders.
-        - `template`: Contains the assets of the template.  
+        - `safefly`: Contains the assets of the addon.  
           You can replace the `icon.png` file with your own addon icon.  
           Also, rename this folder to reflect the name of your addon.
-    - `addon-template.mixins.json`: Contains the Mixin configuration for the addon.  
+    - `safefly.mixins.json`: Contains the Mixin configuration for the addon.  
       You can add your own mixins in the `client` array.
     - `fabric.mod.json`: Contains the metadata of the addon.  
       Edit the various fields to reflect the metadata of your addon.

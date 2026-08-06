@@ -13,6 +13,9 @@ loom = "1.16-SNAPSHOT"
 # Meteor (https://github.com/MeteorDevelopment/meteor-client/)
 meteor = "26.1.2-SNAPSHOT"
 
+# Baritone (https://github.com/MeteorDevelopment/baritone)
+baritone = "26.1-SNAPSHOT"
+
 # Mods
 
 [libraries]
@@ -23,6 +26,9 @@ fabric-loader = { module = "net.fabricmc:fabric-loader", version.ref = "fabric-l
 
 # Meteor client
 meteor-client = { module = "meteordevelopment:meteor-client", version.ref = "meteor" }
+
+# Baritone API
+baritone = { module = "meteordevelopment:baritone", version.ref = "baritone" }
 
 # Mods
 

@@ -26,6 +26,9 @@ dependencies {
 
     // Meteor
     implementation(libs.meteor.client)
+
+    // Baritone API
+    implementation(libs.baritone)
 }
 
 java {

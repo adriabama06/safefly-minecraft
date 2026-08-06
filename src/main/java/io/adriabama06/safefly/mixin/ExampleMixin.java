@@ -1,6 +1,6 @@
-package com.example.addon.mixin;
+package io.adriabama06.safefly.mixin;
 
-import com.example.addon.AddonTemplate;
+import io.adriabama06.safefly.SafeFlyAddon;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.main.GameConfig;
 import org.spongepowered.asm.mixin.Mixin;
@@ -26,6 +26,6 @@ public abstract class ExampleMixin {
      */
     @Inject(method = "<init>", at = @At("TAIL"))
     private void onGameLoaded(GameConfig gameConfig, CallbackInfo ci) {
-        AddonTemplate.LOG.info("Hello from ExampleMixin!");
+        SafeFlyAddon.LOG.info("Hello from ExampleMixin!");
     }
 }

@@ -1,24 +1,24 @@
 {
   "schemaVersion": 1,
-  "id": "addon-template",
+  "id": "safefly",
   "version": "${version}",
-  "name": "Addon Template",
-  "description": "An addon template for Meteor Client addons.",
+  "name": "SafeFly",
+  "description": "Fly to a destination with the Elytra and Baritone, then get boxed in Netherrack for safety.",
   "authors": [
-    "seasnail"
+    "adriabama06"
   ],
   "contact": {
-    "sources": "https://github.com/MeteorDevelopment/meteor-addon-template"
+    "sources": "https://github.com/adriabama06/safefly-minecraft"
   },
-  "icon": "assets/template/icon.png",
+  "icon": "assets/safefly/icon.png",
   "environment": "client",
   "entrypoints": {
     "meteor": [
-      "com.example.addon.AddonTemplate"
+      "io.adriabama06.safefly.SafeFlyAddon"
     ]
   },
   "mixins": [
-    "addon-template.mixins.json"
+    "safefly.mixins.json"
   ],
   "custom": {
     "meteor-client:color": "225,25,25",

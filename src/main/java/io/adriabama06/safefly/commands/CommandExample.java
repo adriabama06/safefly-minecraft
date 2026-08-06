@@ -1,4 +1,4 @@
-package com.example.addon.commands;
+package io.adriabama06.safefly.commands;
 
 import com.mojang.brigadier.arguments.StringArgumentType;
 import com.mojang.brigadier.builder.LiteralArgumentBuilder;
