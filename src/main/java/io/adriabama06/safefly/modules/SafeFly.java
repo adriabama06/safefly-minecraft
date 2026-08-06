@@ -3,8 +3,11 @@ package io.adriabama06.safefly.modules;
 import baritone.api.BaritoneAPI;
 import baritone.api.IBaritone;
 import baritone.api.process.IElytraProcess;
+import baritone.api.pathing.goals.GoalBlock;
+import baritone.api.pathing.goals.GoalXZ;
 import meteordevelopment.meteorclient.events.world.TickEvent;
 import meteordevelopment.meteorclient.settings.BlockPosSetting;
+import meteordevelopment.meteorclient.settings.EnumSetting;
 import meteordevelopment.meteorclient.settings.IntSetting;
 import meteordevelopment.meteorclient.settings.Setting;
 import meteordevelopment.meteorclient.settings.SettingGroup;
@@ -23,16 +26,28 @@ import baritone.api.utils.input.Input;
 public class SafeFly extends Module {
     private final SettingGroup sgGeneral = settings.getDefaultGroup();
 
+    public enum CoordinateMode {
+        XYZ,
+        XZ
+    }
+
+    private final Setting<CoordinateMode> coordinateMode = sgGeneral.add(new EnumSetting.Builder<CoordinateMode>()
+        .name("coordinate-mode")
+        .description("Whether to use exact XYZ coordinates (X, Y, Z) or only XZ (horizontal). In XZ mode the Y is ignored.")
+        .defaultValue(CoordinateMode.XYZ)
+        .build()
+    );
+
     private final Setting<BlockPos> targetPos = sgGeneral.add(new BlockPosSetting.Builder()
         .name("target-coordinates")
-        .description("The coordinates to fly to while using the Elytra.")
+        .description("The coordinates to fly to while using the Elytra. In XZ mode the Y is ignored.")
         .defaultValue(new BlockPos(0, 120, 0))
         .build()
     );
 
     private final Setting<Integer> walkRadius = sgGeneral.add(new IntSetting.Builder()
         .name("walk-radius")
-        .description("Max distance (blocks) from target after landing to finish on foot. If further away (out of rockets / unreachable), skip walking.")
+        .description("Max distance (blocks) from target after landing to finish on foot. In XZ mode this is horizontal distance. If further away (out of rockets / unreachable), skip walking.")
         .defaultValue(64)
         .min(1)
         .sliderRange(1, 256)
@@ -111,7 +126,13 @@ public class SafeFly extends Module {
         if (mc.player == null || mc.level == null) return;
 
         BlockPos target = targetPos.get();
-        info("Starting elytra flight to X: %d, Y: %d, Z: %d", target.getX(), target.getY(), target.getZ());
+        BlockPos baritoneTarget = getBaritoneTarget(target);
+
+        if (isXZ()) {
+            info("Starting elytra flight to X: %d, Z: %d (XZ mode - Y ignored)", target.getX(), target.getZ());
+        } else {
+            info("Starting elytra flight to X: %d, Y: %d, Z: %d", target.getX(), target.getY(), target.getZ());
+        }
 
         transitionTo(State.FLYING);
 
@@ -126,12 +147,18 @@ public class SafeFly extends Module {
         IElytraProcess elytra = baritone.getElytraProcess();
         if (!elytra.isLoaded()) {
             warning("Baritone elytra native library not loaded — is the elytra mode available? Trying command fallback...");
-            baritone.getCommandManager().execute(
-                String.format("goto %d %d %d", target.getX(), target.getY(), target.getZ())
-            );
+            if (isXZ()) {
+                baritone.getCommandManager().execute(
+                    String.format("goto %d %d", baritoneTarget.getX(), baritoneTarget.getZ())
+                );
+            } else {
+                baritone.getCommandManager().execute(
+                    String.format("goto %d %d %d", baritoneTarget.getX(), baritoneTarget.getY(), baritoneTarget.getZ())
+                );
+            }
             baritone.getCommandManager().execute("elytra");
         } else {
-            elytra.pathTo(target);
+            elytra.pathTo(baritoneTarget);
         }
     }
 
@@ -175,6 +202,62 @@ public class SafeFly extends Module {
         return mc.player.onGround() && !mc.player.isFallFlying();
     }
 
+    private boolean isXZ() {
+        return coordinateMode.get() == CoordinateMode.XZ;
+    }
+
+    /**
+     * Convert a BlockPos to the effective Baritone target.
+     * In XYZ mode returns the pos unchanged.
+     * In XZ mode keeps X/Z but replaces Y with the player's current Y
+     * so Baritone only cares about the horizontal column.
+     */
+    private BlockPos getBaritoneTarget(BlockPos base) {
+        if (isXZ() && mc.player != null) {
+            return new BlockPos(base.getX(), mc.player.blockPosition().getY(), base.getZ());
+        }
+        return base;
+    }
+
+    /**
+     * Distance to target: 3D Euclidean in XYZ, horizontal only in XZ.
+     */
+    private double distanceToTarget(BlockPos playerPos, BlockPos target) {
+        if (isXZ()) {
+            int dx = playerPos.getX() - target.getX();
+            int dz = playerPos.getZ() - target.getZ();
+            return Math.sqrt((double) dx * dx + (double) dz * dz);
+        } else {
+            return Math.sqrt(playerPos.distSqr(target));
+        }
+    }
+
+    /**
+     * Whether the player is within radius of the target.
+     * Uses 3D closerThan in XYZ, horizontal distance in XZ.
+     */
+    private boolean isWithinDistance(BlockPos playerPos, BlockPos target, double radius) {
+        if (isXZ()) {
+            int dx = playerPos.getX() - target.getX();
+            int dz = playerPos.getZ() - target.getZ();
+            return (dx * dx + dz * dz) < radius * radius;
+        } else {
+            return playerPos.closerThan(target, radius);
+        }
+    }
+
+    /**
+     * Set Baritone walking goal correctly for the current coordinate mode.
+     * In XYZ uses GoalBlock (exact X Y Z), in XZ uses GoalXZ (only X Z, Y ignored).
+     */
+    private void setWalkingGoal(BlockPos pos) {
+        if (isXZ()) {
+            baritone.getCustomGoalProcess().setGoalAndPath(new GoalXZ(pos.getX(), pos.getZ()));
+        } else {
+            baritone.getCustomGoalProcess().setGoalAndPath(new GoalBlock(pos));
+        }
+    }
+
     // ------------------------------------------------------------------
     // FLYING
     // ------------------------------------------------------------------
@@ -214,31 +297,41 @@ public class SafeFly extends Module {
         // (not fall-flying) for ~1 second → Baritone has finished landing.
         BlockPos target = targetPos.get();
         BlockPos playerPos = mc.player.blockPosition();
-        double dist = Math.sqrt(playerPos.distSqr(target));
+        double dist = distanceToTarget(playerPos, target);
         int radius = walkRadius.get();
 
-        info("Landed. Distance to target: %.1f blocks.", dist);
+        if (isXZ()) {
+            info("Landed. Distance to target (horizontal): %.1f blocks.", dist);
+        } else {
+            info("Landed. Distance to target: %.1f blocks.", dist);
+        }
 
         if (dist <= radius) {
             // If we landed basically on the exact target block, skip walking
             // and go straight to centering on that block's center. Otherwise
             // start a normal on-foot goto first.
             baritone.getPathingBehavior().cancelEverything();
-            if (playerPos.closerThan(target, ALREADY_THERE_RADIUS)) {
+            if (isWithinDistance(playerPos, target, ALREADY_THERE_RADIUS)) {
                 info("Landed right on target. Centering on block...");
                 beginCentering(playerPos);
             } else {
-                info("Within walk radius (%d). Walking to exact spot...", radius);
-                baritone.getCommandManager().execute(
-                    String.format("goto %d %d %d", target.getX(), target.getY(), target.getZ())
-                );
+                if (isXZ()) {
+                    info("Within walk radius (%d horizontal). Walking to exact XZ...", radius);
+                } else {
+                    info("Within walk radius (%d). Walking to exact spot...", radius);
+                }
+                setWalkingGoal(target);
                 transitionTo(State.WALKING);
             }
         } else {
             // Too far — out of rockets or unreachable by flight.
             // Per user request, do NOT attempt to walk all the way there.
             // Still center on the current block so the cube builds cleanly.
-            warning("Landed too far from target (%.1f blocks > %d). Skipping walk, building box at current location.", dist, radius);
+            if (isXZ()) {
+                warning("Landed too far from target (%.1f blocks horizontal > %d). Skipping walk, building box at current location.", dist, radius);
+            } else {
+                warning("Landed too far from target (%.1f blocks > %d). Skipping walk, building box at current location.", dist, radius);
+            }
             baritone.getPathingBehavior().cancelEverything();
             beginCentering(playerPos);
         }
@@ -273,7 +366,7 @@ public class SafeFly extends Module {
 
         // Fast path: already on (or right on top of) the target → skip to
         // centering, no need to wait for Baritone to ever start pathing.
-        if (isPlayerSettled() && playerPos.closerThan(target, ALREADY_THERE_RADIUS)) {
+        if (isPlayerSettled() && isWithinDistance(playerPos, target, ALREADY_THERE_RADIUS)) {
             settledTicks++;
             if (settledTicks >= SETTLED_TICKS_REQUIRED) {
                 info("Reached target block. Centering...");
@@ -292,7 +385,7 @@ public class SafeFly extends Module {
         // never started walking, bail out (probably same-spot or unreachable)
         // and center/box where we stand.
         if (!seenGroundPathingInWalkingState && ticksInState > WALKING_START_TIMEOUT) {
-            if (playerPos.closerThan(target, 3)) {
+            if (isWithinDistance(playerPos, target, 3)) {
                 info("Baritone didn't need to walk (already at target). Centering...");
             } else {
                 warning("Baritone failed to start walking. Centering/boxing at current location.");
@@ -318,7 +411,7 @@ public class SafeFly extends Module {
 
         // Determine the block we actually ended up on. If Baritone got us
         // close to the target, use the target; otherwise use where we stand.
-        BlockPos centerOn = playerPos.closerThan(target, 3) ? target : playerPos;
+        BlockPos centerOn = isWithinDistance(playerPos, target, 3) ? target : playerPos;
         if (centerOn == target) {
             info("Reached target block. Centering...");
         } else {
@@ -340,9 +433,7 @@ public class SafeFly extends Module {
         // when standing on a solid block). Baritone's goto to the solid block
         // itself will place us standing on top of it.
         baritone.getPathingBehavior().cancelEverything();
-        baritone.getCommandManager().execute(
-            String.format("goto %d %d %d", blockToCenterOn.getX(), blockToCenterOn.getY(), blockToCenterOn.getZ())
-        );
+        setWalkingGoal(blockToCenterOn);
         transitionTo(State.CENTERING);
     }
 
@@ -486,7 +577,7 @@ public class SafeFly extends Module {
         BlockPos pPos = mc.player.blockPosition();
 
         BlockPos[] boxPositions = new BlockPos[] {
-            pPos.below(),
+            pPos.below(), pPos.below().north(),
             pPos.north(), pPos.south(), pPos.east(), pPos.west(),
             pPos.above().north(), pPos.above().south(), pPos.above().east(), pPos.above().west(),
             pPos.above(2).north(), pPos.above(2)
