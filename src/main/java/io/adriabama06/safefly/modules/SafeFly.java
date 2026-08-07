@@ -7,18 +7,25 @@ import baritone.api.pathing.goals.GoalBlock;
 import baritone.api.pathing.goals.GoalXZ;
 import meteordevelopment.meteorclient.events.world.TickEvent;
 import meteordevelopment.meteorclient.settings.BlockPosSetting;
+import meteordevelopment.meteorclient.settings.BoolSetting;
 import meteordevelopment.meteorclient.settings.EnumSetting;
 import meteordevelopment.meteorclient.settings.IntSetting;
+import meteordevelopment.meteorclient.settings.ItemListSetting;
 import meteordevelopment.meteorclient.settings.Setting;
 import meteordevelopment.meteorclient.settings.SettingGroup;
 import meteordevelopment.meteorclient.systems.modules.Category;
 import meteordevelopment.meteorclient.systems.modules.Module;
 import meteordevelopment.meteorclient.utils.player.FindItemResult;
 import meteordevelopment.meteorclient.utils.player.InvUtils;
+import meteordevelopment.meteorclient.utils.player.PlayerUtils;
 import meteordevelopment.meteorclient.utils.world.BlockUtils;
 import meteordevelopment.orbit.EventHandler;
 import net.minecraft.core.BlockPos;
+import net.minecraft.world.item.Item;
 import net.minecraft.world.item.Items;
+
+import java.util.Collections;
+import java.util.List;
 
 // Baritone movement-input enum (used to tap forward/back/left/right).
 import baritone.api.utils.input.Input;
@@ -47,10 +54,32 @@ public class SafeFly extends Module {
 
     private final Setting<Integer> walkRadius = sgGeneral.add(new IntSetting.Builder()
         .name("walk-radius")
-        .description("Max distance (blocks) from target after landing to finish on foot. In XZ mode this is horizontal distance. If further away (out of rockets / unreachable), skip walking.")
+        .description("Max distance (blocks) from target after landing to finish on foot. In XZ mode this is horizontal distance. If further away (out of rockets / unreachable), skip walking. (1 = Disabled)")
         .defaultValue(64)
         .min(1)
         .sliderRange(1, 256)
+        .build()
+    );
+
+    private final Setting<Boolean> autoAdjust = sgGeneral.add(new BoolSetting.Builder()
+        .name("auto-adjust")
+        .description("After landing, walk/center to the exact target block if Baritone lands a bit further away.")
+        .defaultValue(true)
+        .build()
+    );
+
+    private final Setting<Boolean> buildBox = sgGeneral.add(new BoolSetting.Builder()
+        .name("build-box")
+        .description("Build a box around you upon arrival.")
+        .defaultValue(true)
+        .build()
+    );
+
+    private final Setting<List<Item>> boxItems = sgGeneral.add(new ItemListSetting.Builder()
+        .name("box-items")
+        .description("Items used to build the box (the first one found in your hotbar is used).")
+        .defaultValue(Collections.singletonList(Items.NETHERRACK))
+        .visible(buildBox::get)
         .build()
     );
 
@@ -100,7 +129,7 @@ public class SafeFly extends Module {
 
     // How close to the exact center (in blocks) we need to be before starting
     // to build the cube. Block-center is at x+0.5, z+0.5.
-    private static final double CENTER_TOLERANCE = 0.2;
+    private static final double CENTER_TOLERANCE = 0.15;
 
     public SafeFly(Category category) {
         super(category, "safe-fly", "Flies to a set of coordinates with Baritone and boxes yourself in Netherrack upon arrival or when you run out of fireworks.");
@@ -152,6 +181,10 @@ public class SafeFly extends Module {
         if (baritone.getPathingBehavior().isPathing()) {
             baritone.getPathingBehavior().cancelEverything();
         }
+
+        var input = baritone.getInputOverrideHandler();
+        input.clearAllKeys();
+
         currentState = State.IDLE;
     }
 
@@ -177,6 +210,7 @@ public class SafeFly extends Module {
         settledTicks = 0;
         ticksInState = 0;
         seenGroundPathingInWalkingState = false;
+        isSettedBoxingRefPosition = false;
     }
 
     /**
@@ -285,7 +319,10 @@ public class SafeFly extends Module {
             // and go straight to centering on that block's center. Otherwise
             // start a normal on-foot goto first.
             baritone.getPathingBehavior().cancelEverything();
-            if (isWithinDistance(playerPos, target, ALREADY_THERE_RADIUS)) {
+            if (!autoAdjust.get()) {
+                info("Auto-adjust disabled. Staying where Baritone landed.");
+                finishArrival();
+            } else if (isWithinDistance(playerPos, target, ALREADY_THERE_RADIUS)) {
                 info("Landed right on target. Centering on block...");
                 beginCentering();
             } else {
@@ -307,7 +344,11 @@ public class SafeFly extends Module {
                 warning("Landed too far from target (%.1f blocks > %d). Skipping walk, building box at current location.", dist, radius);
             }
             baritone.getPathingBehavior().cancelEverything();
-            beginCentering();
+            if (!autoAdjust.get()) {
+                finishArrival();
+            } else {
+                beginCentering();
+            }
         }
     }
 
@@ -403,6 +444,21 @@ public class SafeFly extends Module {
     }
 
     /**
+     * Called when we have arrived at the final spot: build the box if enabled,
+     * otherwise just disable the module.
+     */
+    private void finishArrival() {
+        baritone.getInputOverrideHandler().clearAllKeys();
+        baritone.getPathingBehavior().cancelEverything();
+        if (buildBox.get()) {
+            transitionTo(State.BOXING);
+        } else {
+            info("Arrived. Box building disabled, disabling SafeFly.");
+            toggle();
+        }
+    }
+
+    /**
      * CENTERING: look at the center of the current block and walk forward sneaking
      * until within CENTER_TOLERANCE.
      */
@@ -414,7 +470,7 @@ public class SafeFly extends Module {
             warning("Centering timed out, building box where I stand.");
             baritone.getInputOverrideHandler().clearAllKeys();
             baritone.getPathingBehavior().cancelEverything();
-            transitionTo(State.BOXING);
+            finishArrival();
             return;
         }
 
@@ -433,8 +489,8 @@ public class SafeFly extends Module {
             input.clearAllKeys();
             var vel = mc.player.getDeltaMovement();
             mc.player.setDeltaMovement(0, vel.y, 0);
-            info("Centered on block. Building Netherrack box...");
-            transitionTo(State.BOXING);
+            info("Centered on block.");
+            finishArrival();
             return;
         }
 
@@ -453,37 +509,51 @@ public class SafeFly extends Module {
         input.setInputForceState(Input.SPRINT, false);
     }
 
+    private BlockPos boxingRefPosition;
+    private boolean isSettedBoxingRefPosition = false;
+
     // ==================== CUBE BUILDING — DO NOT TOUCH ====================
     private void handleBoxingState() {
-        FindItemResult netherrack = InvUtils.findInHotbar(Items.NETHERRACK);
+        FindItemResult block = InvUtils.findInHotbar(boxItems.get().toArray(new Item[0]));
 
-        if (!netherrack.found()) {
-            error("Could not find Netherrack in the Hotbar. Cannot box yourself in.");
+        
+        if (!block.found()) {
+            error("Could not find any of the selected box items in the Hotbar. Cannot box yourself in.");
             toggle();
             return;
         }
+        
+        if(!isSettedBoxingRefPosition) {
+            isSettedBoxingRefPosition = true;
+            boxingRefPosition = mc.player.blockPosition();
+            
+            var input = baritone.getInputOverrideHandler();
+            input.setInputForceState(Input.JUMP, true);
+        }
 
-        BlockPos pPos = mc.player.blockPosition();
+        BlockPos pPos = boxingRefPosition;
 
         BlockPos[] boxPositions = new BlockPos[] {
             pPos.below(), pPos.below().north(),
-            pPos.north(), pPos.south(), pPos.east(), pPos.west(),
-            pPos.above().north(), pPos.above().south(), pPos.above().east(), pPos.above().west(),
-            pPos.above(2).north(), pPos.above(2)
+            pPos.north(), pPos.east(), pPos.south(), pPos.west(),
+            pPos.above().north(), pPos.above().east(), pPos.above().south(), pPos.above().west(),
+            pPos.above(2).west(), pPos.above(2)
         };
 
         boolean finishedBuilding = true;
 
         for (BlockPos pos : boxPositions) {
             if (mc.level.getBlockState(pos).isAir()) {
-                BlockUtils.place(pos, netherrack, true, 50);
+                BlockUtils.place(pos, block, true, 50);
                 finishedBuilding = false;
                 break;
             }
         }
 
         if (finishedBuilding) {
-            info("Player fully boxed in Netherrack. Disabling SafeFly.");
+            isSettedBoxingRefPosition = false;
+
+            info("Player fully boxed in. Disabling SafeFly.");
             toggle();
         }
     }
